@@ -3,6 +3,9 @@ import datetime
 import os
 import re
 import time
+import json
+from collections import Counter, defaultdict
+from zoneinfo import ZoneInfo
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -28,6 +31,12 @@ FEEDBACK_CHANNEL_ID = 1534698367983292558
 ACCEPTED_ROLE_ID = 1536068615940472992
 PIC_ROLE_ID = 1534698182162911446
 
+MESSAGE_STATS_CHANNEL_ID = 1541487960564699236
+MESSAGE_STATS_FILE = "message_stats.json"
+MESSAGE_STATS_TIMEZONE = "Africa/Casablanca"
+TOP_MESSAGES_LIMIT = 10
+
+
 VOICE_CHANNEL_ID = 1537441135935627386
 CUSTOM_EMOJI_REACTION = "<:Akatsuki:1534740400793976862>"
 
@@ -35,6 +44,243 @@ CUSTOM_EMOJI_REACTION = "<:Akatsuki:1534740400793976862>"
 # نظام الـ AFK (تخزين بيانات المستخدمين)
 # ---------------------------------------------------------
 afk_users = {}
+
+# ---------------------------------------------------------
+# نظام إحصائيات الرسائل (Daily / Weekly / Monthly / All Time)
+# ---------------------------------------------------------
+stats_lock = asyncio.Lock()
+stats_data = {
+    "messages": [],          # {"user_id", "display_name", "timestamp", "content"}
+    "started_at": None,
+}
+stats_task = None
+stats_timezone = ZoneInfo(MESSAGE_STATS_TIMEZONE)
+
+
+def load_message_stats():
+    global stats_data
+    try:
+        with open(MESSAGE_STATS_FILE, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+            if isinstance(loaded, dict) and isinstance(loaded.get("messages"), list):
+                stats_data = loaded
+            else:
+                raise ValueError("Invalid stats file")
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        stats_data = {"messages": [], "started_at": None}
+
+    if not stats_data.get("started_at"):
+        stats_data["started_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        save_message_stats()
+
+
+def save_message_stats():
+    tmp_file = MESSAGE_STATS_FILE + ".tmp"
+    with open(tmp_file, "w", encoding="utf-8") as f:
+        json.dump(stats_data, f, ensure_ascii=False, separators=(",", ":"))
+    os.replace(tmp_file, MESSAGE_STATS_FILE)
+
+
+def now_utc():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def parse_stats_timestamp(value):
+    try:
+        dt = datetime.datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt.astimezone(datetime.timezone.utc)
+    except Exception:
+        return None
+
+
+def period_start(period):
+    now_local = now_utc().astimezone(stats_timezone)
+
+    if period == "day":
+        return now_local.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(datetime.timezone.utc)
+
+    if period == "week":
+        monday = now_local - datetime.timedelta(days=now_local.weekday())
+        return monday.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(datetime.timezone.utc)
+
+    if period == "month":
+        return now_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0).astimezone(datetime.timezone.utc)
+
+    if period == "all":
+        return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+
+    raise ValueError(f"Unknown period: {period}")
+
+
+def period_label(period):
+    return {
+        "day": "اليوم",
+        "week": "هذا الأسبوع",
+        "month": "هذا الشهر",
+        "all": "كل الوقت",
+    }[period]
+
+
+def is_spammer(user_messages):
+    """
+    Spam heuristic:
+    - 8+ messages within 2 seconds, OR
+    - 5+ identical messages within 10 seconds, OR
+    - 100+ messages within 60 seconds.
+    This is only a report label; it does not punish or block anyone.
+    """
+    if len(user_messages) < 5:
+        return False
+
+    timestamps = []
+    contents = Counter()
+
+    for item in user_messages:
+        dt = parse_stats_timestamp(item["timestamp"])
+        if dt:
+            timestamps.append(dt)
+        normalized = re.sub(r"\s+", " ", item.get("content", "").strip().lower())
+        if normalized:
+            contents[normalized] += 1
+
+    timestamps.sort()
+
+    # Burst detection.
+    left = 0
+    for right in range(len(timestamps)):
+        while timestamps[right] - timestamps[left] > datetime.timedelta(seconds=2):
+            left += 1
+        if right - left + 1 >= 8:
+            return True
+
+    # Repeated identical messages.
+    if any(count >= 5 for count in contents.values()):
+        for content, count in contents.items():
+            if count < 5:
+                continue
+            same_times = []
+            for item in user_messages:
+                normalized = re.sub(r"\s+", " ", item.get("content", "").strip().lower())
+                if normalized == content:
+                    dt = parse_stats_timestamp(item["timestamp"])
+                    if dt:
+                        same_times.append(dt)
+            same_times.sort()
+            for i in range(len(same_times)):
+                j = i
+                while j < len(same_times) and same_times[j] - same_times[i] <= datetime.timedelta(seconds=10):
+                    j += 1
+                if j - i >= 5:
+                    return True
+
+    # Very high-volume sender.
+    if len(user_messages) >= 100:
+        return True
+
+    return False
+
+
+async def record_message_for_stats(message: discord.Message):
+    if message.author.bot or not message.guild:
+        return
+
+    item = {
+        "user_id": str(message.author.id),
+        "display_name": message.author.display_name,
+        "timestamp": message.created_at.astimezone(datetime.timezone.utc).isoformat(),
+        "content": message.content[:1000],
+    }
+
+    async with stats_lock:
+        stats_data["messages"].append(item)
+
+        # Keep the complete all-time history. This file is intentionally persistent.
+        # Save every message so a restart does not erase all-time statistics.
+        save_message_stats()
+
+
+def build_top_message_embed(period):
+    start = period_start(period)
+    selected = []
+
+    for item in stats_data.get("messages", []):
+        if not item.get("user_id"):
+            continue
+        dt = parse_stats_timestamp(item.get("timestamp", ""))
+        if dt and dt >= start:
+            selected.append(item)
+
+    counts = Counter(item["user_id"] for item in selected)
+    top = counts.most_common(TOP_MESSAGES_LIMIT)
+
+    embed = discord.Embed(
+        title=f"📊 Top 10 — أكثر الأعضاء إرسالاً للرسائل ({period_label(period)})",
+        description=(
+            f"**الفترة:** `{period_label(period)}`\n"
+            f"**عدد الرسائل المحسوبة:** `{len(selected):,}`"
+        ),
+        color=discord.Color.blurple(),
+    )
+
+    if not top:
+        embed.description += "\n\nلا توجد رسائل مسجلة في هذه الفترة."
+        return embed
+
+    for rank, (user_id, count) in enumerate(top, 1):
+        user_messages = [m for m in selected if m["user_id"] == user_id]
+        spam_tag = " **🚨 SPAMMER**" if is_spammer(user_messages) else ""
+        mention = f"<@{user_id}>"
+        embed.add_field(
+            name=f"#{rank} {mention}{spam_tag}",
+            value=f"💬 **{count:,}** رسالة",
+            inline=False,
+        )
+
+    embed.set_footer(
+        text=f"Message Stats • {datetime.datetime.now(stats_timezone).strftime('%d/%m/%Y %H:%M')}"
+    )
+    return embed
+
+
+async def send_top_message_report(channel, period="day"):
+    async with stats_lock:
+        embed = build_top_message_embed(period)
+    await channel.send(embed=embed)
+
+
+async def daily_message_stats_scheduler():
+    await bot.wait_until_ready()
+
+    while not bot.is_closed():
+        try:
+            now_local = datetime.datetime.now(stats_timezone)
+            next_midnight = (now_local + datetime.timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            seconds = max((next_midnight - now_local).total_seconds(), 1)
+            await asyncio.sleep(seconds)
+
+            channel = bot.get_channel(MESSAGE_STATS_CHANNEL_ID)
+            if channel is None:
+                try:
+                    channel = await bot.fetch_channel(MESSAGE_STATS_CHANNEL_ID)
+                except Exception as e:
+                    print(f"❌ Message stats channel error: {e}")
+                    continue
+
+            await send_top_message_report(channel, "day")
+            print("✅ Daily message stats sent automatically.")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"❌ Daily message stats scheduler error: {e}")
+            await asyncio.sleep(10)
+
+
+load_message_stats()
+
 
 TICKET_SHOP_CHANNELS = [
     1534698295711236106,
@@ -255,6 +501,10 @@ async def on_ready():
     print(f"Developer: {DEVELOPER_NAME}")
     print("==========================================")
 
+    global stats_task
+    if stats_task is None or stats_task.done():
+        stats_task = asyncio.create_task(daily_message_stats_scheduler())
+
     try:
         channel = bot.get_channel(VOICE_CHANNEL_ID)
         if not channel:
@@ -284,6 +534,8 @@ async def remove_user_roles(guild: discord.Guild, member: discord.Member):
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
+
+    await record_message_for_stats(message)
 
     content_raw = message.content.strip()
     content_clean = content_raw.lower()
@@ -565,6 +817,35 @@ async def on_message(message: discord.Message):
 # ---------------------------------------------------------
 # Slash Commands
 # ---------------------------------------------------------
+
+@bot.tree.command(
+    name="topmessages",
+    description="عرض Top 10 للأعضاء الأكثر إرسالاً للرسائل"
+)
+@app_commands.describe(
+    period="الفترة التي تريد الإحصائيات الخاصة بها"
+)
+@app_commands.choices(period=[
+    app_commands.Choice(name="Today / اليوم", value="day"),
+    app_commands.Choice(name="This Week / هذا الأسبوع", value="week"),
+    app_commands.Choice(name="This Month / هذا الشهر", value="month"),
+    app_commands.Choice(name="All Time / كل الوقت", value="all"),
+])
+async def top_messages_command(
+    interaction: discord.Interaction,
+    period: app_commands.Choice[str]
+):
+    await interaction.response.defer()
+    try:
+        embed = build_top_message_embed(period.value)
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(
+            f"❌ حدث خطأ أثناء إنشاء الإحصائيات: `{e}`",
+            ephemeral=True,
+        )
+
+
 @bot.tree.command(name="createtemporaryroom", description="إنشاء روم مؤقتة تنحذف تلقائياً بعد مدة محددة")
 @app_commands.describe(
     name="اسم الروم",
