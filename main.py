@@ -201,7 +201,23 @@ async def record_message_for_stats(message: discord.Message):
         save_message_stats()
 
 
-def build_top_message_embed(period):
+async def get_member_name(guild, user_id, fallback="Unknown User"):
+    if guild is None:
+        return fallback
+
+    try:
+        member = guild.get_member(int(user_id))
+        if member is None:
+            member = await guild.fetch_member(int(user_id))
+        if member:
+            return member.display_name
+    except Exception:
+        pass
+
+    return fallback
+
+
+async def build_top_message_embed(period, guild=None):
     start = period_start(period)
     selected = []
 
@@ -216,10 +232,10 @@ def build_top_message_embed(period):
     top = counts.most_common(TOP_MESSAGES_LIMIT)
 
     embed = discord.Embed(
-        title=f"📊 Top 10 — أكثر الأعضاء إرسالاً للرسائل ({period_label(period)})",
+        title=f"📊 Top 10 • أكثر الأعضاء إرسالاً ({period_label(period)})",
         description=(
-            f"**الفترة:** `{period_label(period)}`\n"
-            f"**عدد الرسائل المحسوبة:** `{len(selected):,}`"
+            f"🕒 **الفترة:** `{period_label(period)}`\n"
+            f"💬 **إجمالي الرسائل:** `{len(selected):,}`"
         ),
         color=discord.Color.blurple(),
     )
@@ -228,25 +244,36 @@ def build_top_message_embed(period):
         embed.description += "\n\nلا توجد رسائل مسجلة في هذه الفترة."
         return embed
 
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+
     for rank, (user_id, count) in enumerate(top, 1):
         user_messages = [m for m in selected if m["user_id"] == user_id]
-        spam_tag = " **🚨 SPAMMER**" if is_spammer(user_messages) else ""
-        mention = f"<@{user_id}>"
+        spam_tag = "  🚨 **SPAMMER**" if is_spammer(user_messages) else ""
+
+        fallback_name = next(
+            (m.get("display_name") for m in user_messages if m.get("display_name")),
+            f"User {user_id}"
+        )
+        display_name = await get_member_name(guild, user_id, fallback_name)
+        display_name = discord.utils.escape_markdown(display_name)
+
+        prefix = medals.get(rank, f"**#{rank}**")
         embed.add_field(
-            name=f"#{rank} {mention}{spam_tag}",
-            value=f"💬 **{count:,}** رسالة",
+            name=f"{prefix}  {display_name}{spam_tag}",
+            value=f"💬 **{count:,}** رسالة  •  🆔 `{user_id}`",
             inline=False,
         )
 
     embed.set_footer(
-        text=f"Message Stats • {datetime.datetime.now(stats_timezone).strftime('%d/%m/%Y %H:%M')}"
+        text=f"Message Stats • Africa/Casablanca • {datetime.datetime.now(stats_timezone).strftime('%d/%m/%Y %H:%M')}"
     )
     return embed
 
 
 async def send_top_message_report(channel, period="day"):
     async with stats_lock:
-        embed = build_top_message_embed(period)
+        guild = getattr(channel, "guild", None)
+        embed = await build_top_message_embed(period, guild)
     await channel.send(embed=embed)
 
 
@@ -539,6 +566,87 @@ async def on_message(message: discord.Message):
 
     content_raw = message.content.strip()
     content_clean = content_raw.lower()
+
+    # Plain-text stats commands (no slash and no prefix needed):
+    # t day / t week / t month / t all time
+    plain_stats_periods = {
+        "t day": "day",
+        "t week": "week",
+        "t month": "month",
+        "t all": "all",
+        "t all time": "all",
+    }
+    if content_clean in plain_stats_periods:
+        try:
+            await send_top_message_report(
+                message.channel,
+                plain_stats_periods[content_clean]
+            )
+        except Exception as e:
+            await message.channel.send(
+                f"❌ وقع خطأ فإحصائيات الرسائل: `{e}`"
+            )
+        return
+
+    # text @user / text <user_id> -> show the latest messages of that member.
+    if content_clean.startswith("text "):
+        target_text = content_raw[5:].strip()
+        target_id = None
+
+        mention_match = re.fullmatch(r"<@!?(\d+)>", target_text)
+        if mention_match:
+            target_id = int(mention_match.group(1))
+        elif target_text.isdigit():
+            target_id = int(target_text)
+
+        if target_id is not None:
+            target_member = message.guild.get_member(target_id) if message.guild else None
+            if target_member is None and message.guild:
+                try:
+                    target_member = await message.guild.fetch_member(target_id)
+                except Exception:
+                    target_member = None
+
+            user_messages = [
+                item for item in stats_data.get("messages", [])
+                if str(item.get("user_id")) == str(target_id)
+            ]
+            user_messages.sort(
+                key=lambda item: parse_stats_timestamp(item.get("timestamp", ""))
+                or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc),
+                reverse=True
+            )
+
+            if not user_messages:
+                await message.channel.send("❌ ما لقيتش رسائل مسجلة لهاد العضو.")
+                return
+
+            name = (
+                target_member.display_name
+                if target_member
+                else user_messages[0].get("display_name", f"User {target_id}")
+            )
+
+            embed = discord.Embed(
+                title=f"💬 Messages • {discord.utils.escape_markdown(name)}",
+                description=f"آخر **{min(10, len(user_messages))}** رسائل مسجلة",
+                color=discord.Color.blurple(),
+            )
+
+            for item in user_messages[:10]:
+                dt = parse_stats_timestamp(item.get("timestamp", ""))
+                when = dt.astimezone(stats_timezone).strftime("%d/%m/%Y %H:%M") if dt else "Unknown time"
+                content = item.get("content", "").strip() or "*(بدون نص)*"
+                content = discord.utils.escape_markdown(content[:500])
+                embed.add_field(
+                    name=f"🕒 {when}",
+                    value=content,
+                    inline=False,
+                )
+
+            embed.set_footer(text="Message Stats • Africa/Casablanca")
+            await message.channel.send(embed=embed)
+            return
 
     if content_clean == ".afk" or content_clean.startswith(".afk "):
         reason_text = content_raw[4:].strip()
@@ -837,7 +945,7 @@ async def top_messages_command(
 ):
     await interaction.response.defer()
     try:
-        embed = build_top_message_embed(period.value)
+        embed = await build_top_message_embed(period.value, interaction.guild)
         await interaction.followup.send(embed=embed)
     except Exception as e:
         await interaction.followup.send(
